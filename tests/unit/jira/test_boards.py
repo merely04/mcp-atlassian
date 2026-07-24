@@ -99,3 +99,60 @@ def test_get_all_agile_boards_model(boards_mixin, mock_boards):
     assert result == [
         JiraBoard.from_api_response(value) for value in mock_boards["values"]
     ]
+
+
+def test_move_issues_to_board(boards_mixin):
+    """Issues are posted to the board's agile endpoint."""
+    result = boards_mixin.move_issues_to_board(
+        board_id="4", issue_keys=["PROJ-1", "PROJ-2"]
+    )
+
+    assert result is True
+    boards_mixin.jira.post.assert_called_once_with(
+        "rest/agile/1.0/board/4/issue",
+        data={"issues": ["PROJ-1", "PROJ-2"]},
+    )
+
+
+def test_move_issues_to_board_propagates_http_error(boards_mixin):
+    """A failed move must surface — silently swallowing it would report success."""
+    boards_mixin.jira.post.side_effect = requests.HTTPError(
+        response=MagicMock(content="API Error content")
+    )
+
+    with pytest.raises(requests.HTTPError):
+        boards_mixin.move_issues_to_board(board_id="4", issue_keys=["PROJ-1"])
+
+
+def test_get_board_card_keys(boards_mixin):
+    """Card keys are read from the board's work data."""
+    boards_mixin.jira.get.return_value = {
+        "issuesData": {
+            "issues": [
+                {"key": "PROJ-1", "statusName": "In Progress"},
+                {"key": "PROJ-2", "statusName": "Done"},
+            ]
+        }
+    }
+
+    result = boards_mixin.get_board_card_keys("4")
+
+    assert result == {"PROJ-1", "PROJ-2"}
+    boards_mixin.jira.get.assert_called_once_with(
+        "rest/greenhopper/1.0/xboard/work/allData",
+        params={"rapidViewId": "4"},
+    )
+
+
+def test_get_board_card_keys_unavailable(boards_mixin):
+    """The endpoint is not public API — degrade to None instead of raising."""
+    boards_mixin.jira.get.side_effect = Exception("404 Not Found")
+
+    assert boards_mixin.get_board_card_keys("4") is None
+
+
+def test_get_board_card_keys_unexpected_payload(boards_mixin):
+    """A response without issuesData must not blow up the caller."""
+    boards_mixin.jira.get.return_value = {"unexpected": "shape"}
+
+    assert boards_mixin.get_board_card_keys("4") is None

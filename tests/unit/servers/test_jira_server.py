@@ -146,6 +146,11 @@ def mock_jira_fetcher():
 
     mock_fetcher.update_issue.side_effect = mock_update_issue
 
+    # Configure board placement (jira_move_issues_to_board)
+    mock_fetcher.get_all_agile_boards.return_value = [{"id": 4, "name": "Board TEST"}]
+    mock_fetcher.move_issues_to_board.return_value = True
+    mock_fetcher.get_board_card_keys.side_effect = lambda board_id: {"TEST-1", "TEST-2"}
+
     # Configure batch_create_issues
     def mock_batch_create_issues(issues, validate_only=False):
         if not isinstance(issues, list):
@@ -411,6 +416,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
         get_user_profile,
         get_worklog,
         link_to_epic,
+        move_issues_to_board,
         remove_issue_link,
         search,
         search_fields,
@@ -456,6 +462,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
     jira_sub_mcp.add_tool(create_sprint)
     jira_sub_mcp.add_tool(update_sprint)
     jira_sub_mcp.add_tool(add_issues_to_sprint)
+    jira_sub_mcp.add_tool(move_issues_to_board)
     jira_sub_mcp.add_tool(batch_create_versions)
     test_mcp.mount(jira_sub_mcp, prefix="jira")
     return test_mcp
@@ -2430,3 +2437,127 @@ async def test_get_field_options_combined(jira_client, mock_jira_fetcher):
     # return_limit=1 caps to first match
     assert len(result) == 1
     assert result[0] == "High"
+
+
+@pytest.mark.anyio
+async def test_move_issues_to_board_explicit_board(jira_client, mock_jira_fetcher):
+    """Keys are normalised and moved to the board given explicitly."""
+    response = await jira_client.call_tool(
+        "jira_move_issues_to_board",
+        {"issue_keys": "test-1, TEST-2", "board_id": "4"},
+    )
+
+    result = json.loads(response.content[0].text)
+    assert result["success"] is True
+    assert result["board_id"] == "4"
+    assert result["moved"] == ["TEST-1", "TEST-2"]
+    assert result["on_board"] == ["TEST-1", "TEST-2"]
+    mock_jira_fetcher.move_issues_to_board.assert_called_once_with(
+        board_id="4", issue_keys=["TEST-1", "TEST-2"]
+    )
+    mock_jira_fetcher.get_all_agile_boards.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_move_issues_to_board_resolves_board_from_project(
+    jira_client, mock_jira_fetcher
+):
+    """Without board_id, the board is looked up by the first key's project."""
+    response = await jira_client.call_tool(
+        "jira_move_issues_to_board", {"issue_keys": "TEST-1"}
+    )
+
+    result = json.loads(response.content[0].text)
+    assert result["board_id"] == "4"
+    mock_jira_fetcher.get_all_agile_boards.assert_called_once_with(project_key="TEST")
+    mock_jira_fetcher.move_issues_to_board.assert_called_once_with(
+        board_id="4", issue_keys=["TEST-1"]
+    )
+
+
+@pytest.mark.anyio
+async def test_move_issues_to_board_ambiguous_board(jira_client, mock_jira_fetcher):
+    """Several boards for the project — fail loudly, listing the candidates."""
+    mock_jira_fetcher.get_all_agile_boards.return_value = [
+        {"id": 4, "name": "Board TEST"},
+        {"id": 9, "name": "Board TEST legacy"},
+    ]
+
+    with pytest.raises(ToolError) as excinfo:
+        await jira_client.call_tool(
+            "jira_move_issues_to_board", {"issue_keys": "TEST-1"}
+        )
+
+    assert "4=Board TEST" in str(excinfo.value)
+    assert "9=Board TEST legacy" in str(excinfo.value)
+    mock_jira_fetcher.move_issues_to_board.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_move_issues_to_board_no_board_for_project(
+    jira_client, mock_jira_fetcher
+):
+    """No board at all is just as unresolvable as several."""
+    mock_jira_fetcher.get_all_agile_boards.return_value = []
+
+    with pytest.raises(ToolError):
+        await jira_client.call_tool(
+            "jira_move_issues_to_board", {"issue_keys": "TEST-1"}
+        )
+
+    mock_jira_fetcher.move_issues_to_board.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_move_issues_to_board_rejects_empty_keys(jira_client, mock_jira_fetcher):
+    """Blank input must not reach the API as an empty move."""
+    with pytest.raises(ToolError):
+        await jira_client.call_tool("jira_move_issues_to_board", {"issue_keys": " , "})
+
+    mock_jira_fetcher.move_issues_to_board.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_move_issues_to_board_rejects_over_50_keys(
+    jira_client, mock_jira_fetcher
+):
+    """Jira caps a move at 50 issues — split before calling, don't half-apply."""
+    with pytest.raises(ToolError) as excinfo:
+        await jira_client.call_tool(
+            "jira_move_issues_to_board",
+            {"issue_keys": ",".join(f"TEST-{i}" for i in range(51))},
+        )
+
+    assert "50" in str(excinfo.value)
+    mock_jira_fetcher.move_issues_to_board.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_move_issues_to_board_unverifiable(jira_client, mock_jira_fetcher):
+    """Card list unreadable → move still reported, on_board is null not empty."""
+    mock_jira_fetcher.get_board_card_keys.side_effect = lambda board_id: None
+
+    response = await jira_client.call_tool(
+        "jira_move_issues_to_board", {"issue_keys": "TEST-1", "board_id": "4"}
+    )
+
+    result = json.loads(response.content[0].text)
+    assert result["success"] is True
+    assert result["on_board"] is None
+
+
+@pytest.mark.anyio
+async def test_move_issues_to_board_reports_missing_card(
+    jira_client, mock_jira_fetcher
+):
+    """A key that didn't land on the board is absent from on_board."""
+    mock_jira_fetcher.get_board_card_keys.side_effect = lambda board_id: {"TEST-1"}
+
+    response = await jira_client.call_tool(
+        "jira_move_issues_to_board",
+        {"issue_keys": "TEST-1,TEST-9", "board_id": "4"},
+    )
+
+    result = json.loads(response.content[0].text)
+    assert result["moved"] == ["TEST-1", "TEST-9"]
+    assert result["on_board"] == ["TEST-1"]
