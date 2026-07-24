@@ -1175,6 +1175,85 @@ async def get_board_issues(
 
 
 @jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_agile"},
+    annotations={"title": "Move Issues to Board", "destructiveHint": False},
+)
+@check_write_access
+async def move_issues_to_board(
+    ctx: Context,
+    issue_keys: Annotated[
+        str,
+        Field(
+            description=(
+                "Comma-separated issue keys to move onto the board "
+                "(e.g., 'PROJ-1,PROJ-2'). Max 50 per call."
+            )
+        ),
+    ],
+    board_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Target board id. If omitted, it is resolved from the project of "
+                "the first issue key (fails if that project has several boards)."
+            ),
+            default=None,
+        ),
+    ] = None,
+) -> str:
+    """Move issues from the backlog onto their agile board.
+
+    Board membership is stored separately from status, so an issue created via
+    `jira_create_issue` lands in the backlog even when its status maps to a board
+    column. Call this right after creating an issue that belongs on the board.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_keys: Comma-separated issue keys.
+        board_id: Target board id, or None to resolve it from the project.
+
+    Returns:
+        JSON string with the target board, the moved keys and — when the board
+        card list is readable — which of them are now on the board.
+
+    Raises:
+        ValueError: If no keys are given, more than 50 are given, or the board
+            cannot be resolved unambiguously.
+    """
+    jira = await get_jira_fetcher(ctx)
+    keys = [k.strip().upper() for k in issue_keys.split(",") if k.strip()]
+    if not keys:
+        raise ValueError("issue_keys must contain at least one issue key")
+    if len(keys) > 50:
+        raise ValueError("Jira accepts at most 50 issues per move; split the call")
+
+    if not board_id:
+        project_key = keys[0].split("-")[0]
+        boards = jira.get_all_agile_boards(project_key=project_key)
+        if len(boards) != 1:
+            found = ", ".join(f"{b.get('id')}={b.get('name')}" for b in boards)
+            msg = (
+                f"Cannot resolve a single board for project {project_key} "
+                f"(found {len(boards)}: {found}). Pass board_id explicitly."
+            )
+            raise ValueError(msg)
+        board_id = str(boards[0]["id"])
+
+    jira.move_issues_to_board(board_id=board_id, issue_keys=keys)
+
+    cards = jira.get_board_card_keys(board_id)
+    result = {
+        "success": True,
+        "board_id": board_id,
+        "moved": keys,
+        "on_board": sorted(k for k in keys if k in cards)
+        if cards is not None
+        else None,
+    }
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(
     tags={"jira", "read", "toolset:jira_agile"},
     annotations={"title": "Get Sprints from Board", "readOnlyHint": True},
 )

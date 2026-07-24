@@ -86,3 +86,48 @@ class BoardsMixin(JiraClient):
             limit=limit,
         )
         return [JiraBoard.from_api_response(board) for board in boards]
+
+    def move_issues_to_board(self, board_id: str, issue_keys: list[str]) -> bool:
+        """Move issues from the backlog onto a board.
+
+        Board membership is tracked separately from status, so an issue created
+        via the API stays in the backlog until it is explicitly moved.
+
+        Args:
+            board_id: The board to move the issues onto.
+            issue_keys: List of issue keys to move (e.g., ["PROJ-1", "PROJ-2"]).
+
+        Returns:
+            True if successful.
+
+        Raises:
+            requests.HTTPError: If the API call fails.
+        """
+        self.jira.post(
+            f"rest/agile/1.0/board/{board_id}/issue",
+            data={"issues": issue_keys},
+        )
+        return True
+
+    def get_board_card_keys(self, board_id: str) -> set[str] | None:
+        """Get the keys of issues actually rendered as cards on a board.
+
+        The public Agile API cannot tell board cards from backlog items on
+        team-managed boards, so this uses the internal greenhopper endpoint.
+
+        Args:
+            board_id: The board to inspect.
+
+        Returns:
+            Set of issue keys on the board, or None if the endpoint is
+            unavailable (it is not part of the public API).
+        """
+        try:
+            data = self.jira.get(
+                "rest/greenhopper/1.0/xboard/work/allData",
+                params={"rapidViewId": board_id},
+            )
+            return {issue["key"] for issue in data["issuesData"]["issues"]}
+        except Exception as e:
+            logger.warning(f"Could not read cards of board {board_id}: {str(e)}")
+            return None
